@@ -1,24 +1,23 @@
 package config
 
-type GlobalConfig struct {
-    Quiet    bool
-    Name     string
-    GetLR    bool
-    Debug    bool
-    Uid      uint64
-    Pid      uint64
-    NR       uint64
-    LogFile  string
-    ExecPath string
-}
+const MAX_COUNT = 10
 
-type Filter struct {
-    uid uint32
-    pid uint32
-    nr  uint32
-}
-type Arch struct {
-    is_32bit bool
+type GlobalConfig struct {
+    Quiet       bool
+    Name        string
+    GetLR       bool
+    GetPC       bool
+    Debug       bool
+    Uid         uint64
+    Pid         uint64
+    SysCall     string
+    NoSysCall   string
+    NoTid       string
+    LogFile     string
+    Is32Bit     bool
+    NoUidFilter bool
+    Bypass      bool
+    ExecPath    string
 }
 
 func NewGlobalConfig() *GlobalConfig {
@@ -26,18 +25,35 @@ func NewGlobalConfig() *GlobalConfig {
     return config
 }
 
-func (this *GlobalConfig) GetFilter() Filter {
-    filter := Filter{
-        uid: uint32(this.Uid),
-        pid: uint32(this.Pid),
-        nr:  uint32(this.NR),
+func (this *GlobalConfig) GetFilter(systable_config SysTableConfig) (Filter, error) {
+    filter := Filter{}
+    if this.NoUidFilter {
+        // 强制忽略uid过滤
+        filter.SetUid(0)
+    } else {
+        filter.SetUid(uint32(this.Uid))
     }
-    return filter
-}
-
-func (this *GlobalConfig) GetArch() Arch {
-    arch := Arch{
-        is_32bit: false,
+    filter.SetPid(uint32(this.Pid))
+    filter.SetArch(this.Is32Bit)
+    filter.SetByPass(this.Bypass)
+    var err error = nil
+    if this.SysCall != "" {
+        err = filter.SetSysCall(this.SysCall, systable_config)
+        if err != nil {
+            return filter, err
+        }
     }
-    return arch
+    if this.NoSysCall != "" {
+        err = filter.SetSysCallBlacklist(this.NoSysCall, systable_config)
+        if err != nil {
+            return filter, err
+        }
+    }
+    if this.NoTid != "" {
+        err = filter.SetTidBlacklist(this.NoTid)
+        if err != nil {
+            return filter, err
+        }
+    }
+    return filter, err
 }

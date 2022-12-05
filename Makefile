@@ -34,8 +34,8 @@ ebpf:
 
 .PHONY: assets
 assets:
-	$(CMD_GO) run github.com/shuLhan/go-bindata/cmd/go-bindata -pkg assets -o "app/assets/ebpf_probe.go" $(wildcard ./app/bytecode/*.o app/config/table.json)
+	$(CMD_GO) run github.com/shuLhan/go-bindata/cmd/go-bindata -pkg assets -o "app/assets/ebpf_probe.go" $(wildcard ./app/bytecode/*.o app/config/table*.json)
 
 .PHONY: build
 build:
-	GOARCH=arm64 GOOS=android CGO_ENABLED=1 CC=aarch64-linux-android29-clang $(CMD_GO) build -ldflags "-w -s" -o bin/estrace .
+	GOARCH=arm64 GOOS=android CGO_ENABLED=1 CC=aarch64-linux-android29-clang $(CMD_GO) build -ldflags "-w -s -extldflags '-Wl,--hash-style=sysv'" -o bin/estrace .

@@ -69,17 +69,23 @@ func (this *Module) Check() {
 }
 
 func (this *Module) Run() error {
-
+	var table_path string
+	if this.conf.Is32Bit {
+		table_path = "app/config/table32.json"
+	} else {
+		table_path = "app/config/table64.json"
+	}
 	this.systable_config = config.NewSysTableConfig()
 	// 获取syscall读取参数的mask配置
-	table_buffer, err := assets.Asset("app/config/table.json")
+	table_buffer, err := assets.Asset(table_path)
 	var tmp_config map[string][]interface{}
 	json.Unmarshal(table_buffer, &tmp_config)
 	for nr, config_arr := range tmp_config {
 		table_config := config.TableConfig{
-			Count: uint32(config_arr[0].(float64)),
-			Name:  config_arr[1].(string),
-			Mask:  uint32(config_arr[2].(float64)),
+			Count:   uint32(config_arr[0].(float64)),
+			Name:    config_arr[1].(string),
+			Mask:    uint32(config_arr[2].(float64)),
+			RetMask: uint32(config_arr[3].(float64)),
 		}
 		this.systable_config[nr] = table_config
 	}
@@ -141,24 +147,25 @@ func (this *Module) Run() error {
 		nr_key, _ := strconv.ParseUint(nr, 10, 32)
 		argMaskMap.Update(unsafe.Pointer(&nr_key), unsafe.Pointer(&table_config.Mask), ebpf.UpdateAny)
 	}
-
-	archMap, found, err := this.bpfManager.GetMap("arch_map")
+	argRetMaskMap, found, err := this.bpfManager.GetMap("arg_ret_mask_map")
 	if !found {
-		return errors.New("cannot find arch_map")
+		return errors.New("cannot find arg_ret_mask_map")
 	}
-
-	// 更新进程架构信息
-	arch_key := 0
-	arch := this.conf.GetArch()
-	archMap.Update(unsafe.Pointer(&arch_key), unsafe.Pointer(&arch), ebpf.UpdateAny)
+	for nr, table_config := range this.systable_config {
+		nr_key, _ := strconv.ParseUint(nr, 10, 32)
+		argRetMaskMap.Update(unsafe.Pointer(&nr_key), unsafe.Pointer(&table_config.RetMask), ebpf.UpdateAny)
+	}
 
 	filterMap, found, err := this.bpfManager.GetMap("filter_map")
 	if !found {
 		return errors.New("cannot find filter_map")
 	}
-	// 更新进程过滤设置
+	// 更新进程过滤配置
 	filter_key := 0
-	filter := this.conf.GetFilter()
+	filter, err := this.conf.GetFilter(this.systable_config)
+	if err != nil {
+		return err
+	}
 	filterMap.Update(unsafe.Pointer(&filter_key), unsafe.Pointer(&filter), ebpf.UpdateAny)
 
 	var errChan = make(chan error, 8)
@@ -176,8 +183,8 @@ func (this *Module) Run() error {
 	if !found {
 		return errors.New("cannot find syscall_events map")
 	}
-	// rd, err := perf.NewReader(syscallEventsMap, os.Getpagesize()*64)
-	rd, err := perf.NewReader(syscallEventsMap, os.Getpagesize()*64, false, false)
+	// rd, err := perf.NewReader(syscallEventsMap, os.Getpagesize()*128)
+	rd, err := perf.NewReader(syscallEventsMap, os.Getpagesize()*128, false, false)
 	if err != nil {
 		errChan <- fmt.Errorf("creating %s reader: %s", syscallEventsMap.String(), err)
 		return nil
@@ -235,7 +242,7 @@ type syscall_data struct {
 	arg_index  uint64
 	args       [6]uint64
 	comm       [16]byte
-	arg_str    [256]byte
+	arg_str    [1024]byte
 }
 
 func (this *Module) Decode(em *ebpf.Map, payload []byte) (event event.SyscallDataEvent, err error) {
@@ -277,21 +284,39 @@ func (this *Module) Decode(em *ebpf.Map, payload []byte) (event event.SyscallDat
 	if err = binary.Read(buf, binary.LittleEndian, &data.arg_str); err != nil {
 		return
 	}
-	base_str := fmt.Sprintf("[%s] type:%d pid:%d tid:%d nr:%s", bytes.TrimSpace(bytes.Trim(data.comm[:], "\x00")), data.mtype, data.pid, data.tid, this.ReadNR(*data))
+	var base_str string
+	if this.conf.Debug {
+		base_str = fmt.Sprintf("[%s] type:%d pid:%d tid:%d nr:%s", bytes.TrimSpace(bytes.Trim(data.comm[:], "\x00")), data.mtype, data.pid, data.tid, this.ReadNR(*data))
+	} else {
+		base_str = fmt.Sprintf("[%s] pid:%d tid:%d nr:%s", bytes.TrimSpace(bytes.Trim(data.comm[:], "\x00")), data.pid, data.tid, this.ReadNR(*data))
+	}
+	// type 和数据发送的顺序相关
 	switch data.mtype {
 	case 1:
+		// --getlr 和 --getpc 建议只使用其中一个
 		if this.conf.GetLR {
 			info, err := this.ParseLR(*data)
 			if err != nil {
 				this.logger.Printf("ParseLR err:%v\n", err)
 			}
-			this.logger.Printf("%s %s LR:%s\n", base_str, this.ReadArgs(*data), info)
-		} else {
-			this.logger.Printf("%s %s\n", base_str, this.ReadArgs(*data))
+			this.logger.Printf("%s LR:0x%x Info:\n%s\n", base_str, data.lr, info)
+		}
+		if this.conf.GetPC {
+			info, err := this.ParsePC(*data)
+			if err != nil {
+				this.logger.Printf("ParsePC err:%v\n", err)
+			}
+			this.logger.Printf("%s PC:0x%x Info:\n%s\n", base_str, data.pc, info)
 		}
 	case 2:
-		this.logger.Printf("%s arg_index:%d arg_str:%s\n", base_str, data.arg_index, bytes.TrimSpace(bytes.Trim(data.arg_str[:], "\x00")))
+		arg_str := strings.SplitN(string(bytes.Trim(data.arg_str[:], "\x00")), "\x00", 2)[0]
+		this.logger.Printf("%s arg_index:%d arg_str:%s\n", base_str, data.arg_index, strings.TrimSpace(arg_str))
 	case 3:
+		this.logger.Printf("%s %s\n", base_str, this.ReadArgs(*data))
+	case 4:
+		arg_str := strings.SplitN(string(bytes.Trim(data.arg_str[:], "\x00")), "\x00", 2)[0]
+		this.logger.Printf("%s arg_index:%d arg_ret_str:%s\n", base_str, data.arg_index, strings.TrimSpace(arg_str))
+	case 5:
 		this.logger.Printf("%s ret:0x%x\n", base_str, data.ret)
 	}
 
@@ -326,6 +351,37 @@ func (this *Module) ParseLR(data syscall_data) (string, error) {
 		if err == nil && n == 7 {
 			if data.lr >= seg_start && data.lr < seg_end {
 				offset := seg_offset + (data.lr - seg_start)
+				info = fmt.Sprintf("%s + 0x%x", seg_path, offset)
+				break
+			}
+		}
+	}
+	return info, err
+}
+
+func (this *Module) ParsePC(data syscall_data) (string, error) {
+	info := "UNKNOWN"
+	// 直接读取maps信息 计算pc在什么地方 定位syscall调用也就一目了然了
+	filename := fmt.Sprintf("/proc/%d/maps", data.pid)
+	content, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return info, fmt.Errorf("Error when opening file:%v", err)
+	}
+	var (
+		seg_start  uint64
+		seg_end    uint64
+		permission string
+		seg_offset uint64
+		device     string
+		inode      uint64
+		seg_path   string
+	)
+	for _, line := range strings.Split(string(content), "\n") {
+		reader := strings.NewReader(line)
+		n, err := fmt.Fscanf(reader, "%x-%x %s %x %s %d %s", &seg_start, &seg_end, &permission, &seg_offset, &device, &inode, &seg_path)
+		if err == nil && n == 7 {
+			if data.pc >= seg_start && data.pc < seg_end {
+				offset := seg_offset + (data.pc - seg_start)
 				info = fmt.Sprintf("%s + 0x%x", seg_path, offset)
 				break
 			}

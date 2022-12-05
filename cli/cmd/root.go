@@ -24,7 +24,7 @@ import (
 var global_config = config.NewGlobalConfig()
 
 var rootCmd = &cobra.Command{
-	Use:               "eSysTrace",
+	Use:               "estrace",
 	Short:             "eBPF on Android案例",
 	Long:              "syscall调用追踪",
 	PersistentPreRunE: persistentPreRunEFunc,
@@ -44,7 +44,7 @@ func runFunc(command *cobra.Command, args []string) {
 	ctx, cancelFun := context.WithCancel(context.TODO())
 
 	// 首先根据全局设定设置日志输出
-	logger := log.New(os.Stdout, "syscall_", log.Ltime)
+	logger := log.New(os.Stdout, "", log.Lmicroseconds)
 	if global_config.LogFile != "" {
 		log_path := global_config.ExecPath + "/" + global_config.LogFile
 		_, err := os.Stat(log_path)
@@ -147,6 +147,8 @@ func runCommand(executable string, args ...string) (string, error) {
 }
 
 func parseByPackage(name string) error {
+	// 先设置默认值
+	global_config.Is32Bit = true
 	// 先检查dumpsys命令 如果没有可能是eadb环境
 	// 那么只能用ps获取正在运行的APP包名
 	result, err := runCommand("which", "dumpsys")
@@ -175,9 +177,16 @@ func parseByPackage(name string) error {
 			line = strings.Trim(line, " ")
 			parts := strings.SplitN(line, "=", 2)
 			if len(parts) == 2 {
-				if parts[0] == "userId" {
-					global_config.Uid, _ = strconv.ParseUint(parts[1], 10, 64)
+				key, value := parts[0], parts[1]
+				switch key {
+				case "userId":
+					global_config.Uid, _ = strconv.ParseUint(value, 10, 64)
 					has_uid = true
+					break
+				case "primaryCpuAbi":
+					if value == "arm64-v8a" {
+						global_config.Is32Bit = false
+					}
 					break
 				}
 			}
@@ -203,9 +212,14 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&global_config.Name, "name", "n", "", "must set uid or package name")
 	rootCmd.PersistentFlags().Uint64VarP(&global_config.Uid, "uid", "u", 0, "must set uid or package name")
 	rootCmd.PersistentFlags().Uint64VarP(&global_config.Pid, "pid", "p", 0, "add pid to filter")
-	rootCmd.PersistentFlags().Uint64VarP(&global_config.NR, "nr", "", 0, "add nr to filter")
+	rootCmd.PersistentFlags().StringVarP(&global_config.SysCall, "syscall", "s", "", "add syscall name to whitelist filter")
+	rootCmd.PersistentFlags().StringVarP(&global_config.NoSysCall, "no-syscall", "", "", "add syscall name to blacklist filter")
+	rootCmd.PersistentFlags().StringVarP(&global_config.NoTid, "no-tid", "", "", "add tid to blacklist filter")
 	rootCmd.PersistentFlags().StringVarP(&global_config.LogFile, "out", "o", "", "save the log to file")
+	rootCmd.PersistentFlags().BoolVarP(&global_config.NoUidFilter, "no-uid-filter", "", false, "ignore uid filter")
+	rootCmd.PersistentFlags().BoolVarP(&global_config.Bypass, "bypass", "", false, "try bypass root check")
 	rootCmd.PersistentFlags().BoolVarP(&global_config.GetLR, "getlr", "", false, "try get lr info")
+	rootCmd.PersistentFlags().BoolVarP(&global_config.GetPC, "getpc", "", false, "try get pc info")
 	rootCmd.PersistentFlags().BoolVarP(&global_config.Debug, "debug", "d", false, "enable debug logging")
 	rootCmd.PersistentFlags().BoolVarP(&global_config.Quiet, "quiet", "q", false, "wont logging to terminal when used")
 }
