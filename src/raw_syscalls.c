@@ -50,12 +50,13 @@ struct {
     __uint(max_entries, 512);
 } arg_ret_mask_map SEC(".maps");
 
-// 用于设置过滤配置
-struct filter_t {
+// syscall过滤配置
+struct syscall_filter_t {
     u32 uid;
     u32 pid;
     u32 is_32bit;
     u32 try_bypass;
+    u32 after_read;
     u32 tid_blacklist_mask;
     u32 tid_blacklist[MAX_COUNT];
     u32 syscall_mask;
@@ -67,27 +68,29 @@ struct filter_t {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, u32);
-    __type(value, struct filter_t);
+    __type(value, struct syscall_filter_t);
     __uint(max_entries, 1);
-} filter_map SEC(".maps");
+} syscall_filter_map SEC(".maps");
 
 static int inline send_data_arg_str(struct bpf_raw_tracepoint_args* ctx, struct syscall_data_t* data, u64 addr) {
     u32 filter_key = 0;
-    struct filter_t* filter = bpf_map_lookup_elem(&filter_map, &filter_key);
+    struct syscall_filter_t* filter = bpf_map_lookup_elem(&syscall_filter_map, &filter_key);
     if (filter == NULL) {
         return 0;
     }
     if (filter->try_bypass) {
-        char target[3][12] = {
+        char target[5][18] = {
             "/dev/.magisk",
+            "/system/bin/magisk",
+            "/system/bin/su",
             "which su",
             "mount",
         };
         #pragma unroll
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 5; i++) {
             bool need_override = true;
             #pragma unroll
-            for (int j = 0; j < 12; j++) {
+            for (int j = 0; j < 18; j++) {
                 if (target[i][j] == 0) break;
                 if (data->arg_str[j] != target[i][j]) {
                     need_override = false;
@@ -102,6 +105,7 @@ static int inline send_data_arg_str(struct bpf_raw_tracepoint_args* ctx, struct 
             }
         }
     }
+    data->type = 2;
     bpf_perf_event_output(ctx, &syscall_events, BPF_F_CURRENT_CPU, data, sizeof(struct syscall_data_t));
     return 0;
 }
@@ -110,7 +114,7 @@ SEC("raw_tracepoint/sys_enter")
 int raw_syscalls_sys_enter(struct bpf_raw_tracepoint_args* ctx) {
 
     u32 filter_key = 0;
-    struct filter_t* filter = bpf_map_lookup_elem(&filter_map, &filter_key);
+    struct syscall_filter_t* filter = bpf_map_lookup_elem(&syscall_filter_map, &filter_key);
     if (filter == NULL) {
         return 0;
     }
@@ -199,6 +203,33 @@ int raw_syscalls_sys_enter(struct bpf_raw_tracepoint_args* ctx) {
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
 
     // 线程名过滤？后面考虑有没有必要
+    // 渲染相关的线程 属实没必要 太多调用了
+    char thread_blacklist[9][15] = {
+        "RenderThread",
+        "RxCachedThreadS",
+        "mali-cmar-backe",
+        "mali-utility-wo",
+        "mali-mem-purge",
+        "mali-hist-dump",
+        "hwuiTask0",
+        "hwuiTask1",
+        "NDK MediaCodec_",
+    };
+    #pragma unroll
+    for (int i = 0; i < 9; i++) {
+        bool need_skip = true;
+        #pragma unroll
+        for (int j = 0; j < 15; j++) {
+            if (thread_blacklist[i][j] == 0) break;
+            if (data->comm[j] != thread_blacklist[i][j]) {
+                need_skip = false;
+                break;
+            }
+        }
+        if (need_skip) {
+            return 0;
+        }
+    }
 
     // 基本信息
     data->pid = pid;
@@ -219,7 +250,6 @@ int raw_syscalls_sys_enter(struct bpf_raw_tracepoint_args* ctx) {
     bpf_perf_event_output(ctx, &syscall_events, BPF_F_CURRENT_CPU, data, sizeof(struct syscall_data_t));
 
     // 获取参数
-    data->type = 2;
     if ((filter->is_32bit && data->syscall_id == 11) || (!filter->is_32bit && data->syscall_id == 221)) {
         // execve 3个参数
         // const char *filename char *const argv[] char *const envp[]
@@ -291,10 +321,16 @@ int raw_syscalls_sys_enter(struct bpf_raw_tracepoint_args* ctx) {
             if (data->args[j] != 0) {
                 __builtin_memset(&data->arg_str, 0, sizeof(data->arg_str));
                 bpf_probe_read_user(data->arg_str, sizeof(struct timespec), (void*)data->args[j]);
+                data->type = 2;
                 bpf_perf_event_output(ctx, &syscall_events, BPF_F_CURRENT_CPU, data, sizeof(struct syscall_data_t));
             }
         }
     } else {
+        // 可能是展开循环或者处于else分支的原因 这里必须得重新获取一次 arg_mask
+        struct arg_mask_t* arg_mask = bpf_map_lookup_elem(&arg_mask_map, &data->syscall_id);
+        if (arg_mask == NULL) {
+            return 0;
+        }
         // 展开循环
         #pragma unroll
         for (int i = 0; i < 6; i++) {
@@ -323,7 +359,7 @@ int raw_syscalls_sys_enter(struct bpf_raw_tracepoint_args* ctx) {
 SEC("raw_tracepoint/sys_exit")
 int raw_syscalls_sys_exit(struct bpf_raw_tracepoint_args* ctx) {
     u32 filter_key = 0;
-    struct filter_t* filter = bpf_map_lookup_elem(&filter_map, &filter_key);
+    struct syscall_filter_t* filter = bpf_map_lookup_elem(&syscall_filter_map, &filter_key);
     if (filter == NULL) {
         return 0;
     }
@@ -408,17 +444,64 @@ int raw_syscalls_sys_exit(struct bpf_raw_tracepoint_args* ctx) {
         }
     }
 
+    // 获取线程名
+    __builtin_memset(&data->comm, 0, sizeof(data->comm));
+    bpf_get_current_comm(&data->comm, sizeof(data->comm));
+
+    char thread_blacklist[9][15] = {
+        "RenderThread",
+        "RxCachedThreadS",
+        "mali-cmar-backe",
+        "mali-utility-wo",
+        "mali-mem-purge",
+        "mali-hist-dump",
+        "hwuiTask0",
+        "hwuiTask1",
+        "NDK MediaCodec_",
+    };
+    #pragma unroll
+    for (int i = 0; i < 9; i++) {
+        bool need_skip = true;
+        #pragma unroll
+        for (int j = 0; j < 15; j++) {
+            if (thread_blacklist[i][j] == 0) break;
+            if (data->comm[j] != thread_blacklist[i][j]) {
+                need_skip = false;
+                break;
+            }
+        }
+        if (need_skip) {
+            return 0;
+        }
+    }
+
+    // 基本信息
+    data->pid = pid;
+    data->tid = tid;
+
+    // 获取字符串参数类型配置
+    struct arg_mask_t* arg_mask = bpf_map_lookup_elem(&arg_mask_map, &data->syscall_id);
+    if (arg_mask == NULL) {
+        return 0;
+    }
+    if (filter->after_read) {
+        data->type = 6;
+        #pragma unroll
+        for (int i = 0; i < 6; i++) {
+            bpf_probe_read_kernel(&data->args[i], sizeof(u64), &regs->regs[i]);
+            if (arg_mask->mask & (1 << i)) {
+                data->arg_index = i;
+                __builtin_memset(&data->arg_str, 0, sizeof(data->arg_str));
+                bpf_probe_read_user(data->arg_str, sizeof(data->arg_str), (void*)data->args[i]);
+                send_data_arg_str(ctx, data, data->args[i]);
+            }
+        }
+    }
+
     struct arg_mask_t* arg_ret_mask = bpf_map_lookup_elem(&arg_ret_mask_map, &data->syscall_id);
     if (arg_ret_mask == NULL) {
         return 0;
     }
-
-    // 获取线程名
-    __builtin_memset(&data->comm, 0, sizeof(data->comm));
-    bpf_get_current_comm(&data->comm, sizeof(data->comm));
-    // 基本信息
-    data->pid = pid;
-    data->tid = tid;
 
     // 获取syscall执行后才会有内容的字符串参数 比如重定向检测
     data->type = 4;

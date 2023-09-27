@@ -156,9 +156,9 @@ func (this *Module) Run() error {
 		argRetMaskMap.Update(unsafe.Pointer(&nr_key), unsafe.Pointer(&table_config.RetMask), ebpf.UpdateAny)
 	}
 
-	filterMap, found, err := this.bpfManager.GetMap("filter_map")
+	filterMap, found, err := this.bpfManager.GetMap("syscall_filter_map")
 	if !found {
-		return errors.New("cannot find filter_map")
+		return errors.New("cannot find syscall_filter_map")
 	}
 	// 更新进程过滤配置
 	filter_key := 0
@@ -183,8 +183,8 @@ func (this *Module) Run() error {
 	if !found {
 		return errors.New("cannot find syscall_events map")
 	}
-	// rd, err := perf.NewReader(syscallEventsMap, os.Getpagesize()*128)
-	rd, err := perf.NewReader(syscallEventsMap, os.Getpagesize()*128, false, false)
+	// rd, err := perf.NewReader(syscallEventsMap, os.Getpagesize()*512)
+	rd, err := perf.NewReader(syscallEventsMap, os.Getpagesize()*512, false, false)
 	if err != nil {
 		errChan <- fmt.Errorf("creating %s reader: %s", syscallEventsMap.String(), err)
 		return nil
@@ -329,6 +329,9 @@ func (this *Module) Decode(em *ebpf.Map, payload []byte) (event event.SyscallDat
 		this.logger.Printf("%s arg_index:%d arg_ret_str:%s\n", base_str, data.arg_index, strings.TrimSpace(arg_str))
 	case 5:
 		this.logger.Printf("%s ret:0x%x\n", base_str, data.ret)
+	case 6:
+		arg_str := strings.SplitN(string(bytes.Trim(data.arg_str[:], "\x00")), "\x00", 2)[0]
+		this.logger.Printf("%s arg_index:%d arg_after_str:%s\n", base_str, data.arg_index, strings.TrimSpace(arg_str))
 	}
 
 	return event, nil
